@@ -1,0 +1,18 @@
+joblogs/
+
+analysis/Models/
+analysis/Models
+analysis/Plots/
+analysis/Plots
+analysis/Pilot/
+analysis/Pilot
+analysis/results*
+
+scripts/backup-power-analysis.sh
+scripts/backup.sh
+scripts/*/*.txt
+scripts/*/*/*.txt
+
+# analysis/accuracy-data.csv
+analysis/*.csv.gz
+analysis/test-priors.r
