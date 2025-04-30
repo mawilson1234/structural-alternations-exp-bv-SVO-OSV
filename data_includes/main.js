@@ -576,8 +576,8 @@ newTrial("bye",
 		"Thank you for participating!<p />" +
 		
 		"Please go to the following web page to verify your participation: " +
-		"<a href='' target='_blank'>" +
-		"" +
+		"<a href='https://app.prolific.com/submissions/complete?cc=CWZ2JTT3' target='_blank'>" +
+		"https://app.prolific.com/submissions/complete?cc=CWZ2JTT3" +
 		"</a>."
 	)
 		.css({'margin': 'auto', 'text-align': 'center', 'width': '30em'})
