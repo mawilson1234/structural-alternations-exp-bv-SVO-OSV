@@ -10,7 +10,7 @@
 #SBATCH --time=01-00:00:00
 #SBATCH --mail-type=FAIL,END,INVALID_DEPEND
 
-module load R/4.1.0-foss-2020b
+module load R/4.4.1-foss-2022b
 
 echo Running script: scripts/bayesian_analysis/bayesian_analysis_crossed.sh
 
