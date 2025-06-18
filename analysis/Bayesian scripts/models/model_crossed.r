@@ -6,5 +6,5 @@ fit.model(
 	data.file = 'accuracy-data-nested.csv',
 	data.function = ident,
 	data.sources = c('human', 'BERT', 'ModernBERT Base', 'ModernBERT Large'),
-	formula.name = 'crossed.test'
+	formula.name = 'crossed'
 )
