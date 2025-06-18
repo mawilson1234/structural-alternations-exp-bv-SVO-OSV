@@ -13,6 +13,8 @@ scripts/backup.sh
 scripts/*/*.txt
 scripts/*/*/*.txt
 
-# analysis/accuracy-data.csv
+analysis/accuracy-data.csv
 analysis/*.csv.gz
 analysis/test-priors.r
+
+scripts/models/model_crossed_*
