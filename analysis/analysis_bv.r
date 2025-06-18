@@ -4,17 +4,17 @@ library(ggh4x)
 library(ggpubr)
 library(stringr)
 library(tidyverse)
+library(ggpattern)
 library(data.table)
 library(reticulate)
 
 # do not change these
-SUBJECTS_RUN_WITH_BAD_DELAY <- 4:9
 MAX_RT_IN_SECONDS <- 10
 MAX_BREAKTIME_IN_SECONDS <- 15 * 60 # 15 minutes
 OUTLIER_RT_SDS <- 2
+SUBJECTS_RUN_WITH_BAD_DELAY <- c()
 
 current.exp <- 'bv'
-MOST_RECENT_SUBJECTS <- 59:62
 
 # confidence interval for beta distribution
 beta_ci <- function(y, ci = 0.95) {
@@ -33,8 +33,6 @@ beta_ci <- function(y, ci = 0.95) {
 # convenience
 s_view <- function(d, x) return (d |> filter(subject %in% x))
 
-s_mr <- function(d) return (d |> s_view(MOST_RECENT_SUBJECTS))
-
 # Load data
 colnames <- c(
 	'time_received', 'ip_md5', 'controller', 'order', 'element_no', 'condition', 
@@ -44,12 +42,12 @@ colnames <- c(
 )
 
 results <- read.csv(
-		paste0('results-', current.exp, '.csv'), 
+		'results_prod.csv', 
 		comment.char='#',
-		header=FALSE, 
+		header = FALSE, 
 		quote='',
-		col.names=colnames, 
-		fill=TRUE
+		col.names = colnames, 
+		fill = TRUE
 	) |> 
 	as_tibble() |>
 	select(ip_md5, condition, order, element_name:template) |>
@@ -62,13 +60,7 @@ results <- results |>
 		subject = as.factor(subject)
 	) |>
 	select(subject, everything()) |>
-	select(-ip_md5) |>
-	mutate(
-		subject = as.numeric(as.character(subject)),
-		subject = match(subject, unique(subject)),
-		subject = as.factor(subject)
-	) |>
-	filter(!subject %in% SUBJECTS_RUN_WITH_BAD_DELAY)
+	select(-ip_md5)
 
 # add columns so that models can be added
 results <- results |>
@@ -94,9 +86,9 @@ breaktimes <- results |>
 		seconds = (minutes %% 1) * 60,
 		milliseconds = (seconds %% 1) * 1000,
 		break_time = paste0(
-			str_pad(trunc(minutes),2,pad='0'), ':', 
-			str_pad(trunc(seconds), 2, pad='0'), '.', 
-			str_pad(round(milliseconds), 3, pad='0')
+			str_pad(trunc(minutes), 2,pad = '0'), ':', 
+			str_pad(trunc(seconds), 2, pad = '0'), '.', 
+			str_pad(round(milliseconds), 3, pad = '0')
 		)
 	) |>
 	select(subject, break_number, break_time, duration)
@@ -104,6 +96,30 @@ breaktimes <- results |>
 excessive.breaktimes <- breaktimes |>
 	filter(duration > MAX_BREAKTIME_IN_SECONDS * 1000) |>
 	droplevels()
+
+training.accuracy.OSV.by.session.no <- results |>
+	filter(
+		condition %like% 'trial_train',
+		parameter == 'Drop'
+	) |>
+	group_by(subject, mask_added_tokens, stop_at) |>
+	mutate(order = rleid(order)) |>
+	filter(
+		grepl('(.*?)\\[obj\\](.*?)\\[subj\\](.*?)', sentence)
+	) |>
+	group_by(subject, data_source, condition, mask_added_tokens, stop_at, order) |> 
+	summarize(n_tries = n()) |>
+	ungroup() |>
+	mutate(session.no = case_when(order <= 21 ~ 1, TRUE ~ ceiling((order - 21)/15)+1)) |>
+	group_by(subject, data_source, mask_added_tokens, stop_at, session.no) |>
+	mutate(total = n()) |>
+	group_by(subject, data_source, mask_added_tokens, stop_at, session.no, n_tries, total) |>
+	summarize(pr_correct = n()) |>
+	ungroup() |>
+	mutate(pr_correct = pr_correct/total) |>
+	group_by(subject, data_source, mask_added_tokens, stop_at) |>
+	filter(n_tries == min(n_tries)) |>
+	rename(pr_first_choice_correct = pr_correct)
 
 # training first choice accuracy by half
 # for some subjects, this is inaccurate due to
@@ -117,21 +133,18 @@ training.accuracy.by.session.no <- results |>
 	) |> 
 	group_by(subject, mask_added_tokens, stop_at) |>
 	mutate(order = rleid(order)) |>
-	group_by(subject, data_source, condition, mask_added_tokens, stop_at, order) |>
+	group_by(subject, data_source, condition, mask_added_tokens, stop_at, order) |> 
 	summarize(n_tries = n()) |>
 	ungroup() |>
 	mutate(session.no = case_when(order <= 21 ~ 1, TRUE ~ ceiling((order - 21)/15)+1)) |>
 	group_by(subject, data_source, mask_added_tokens, stop_at, session.no) |>
 	mutate(total = n()) |>
 	group_by(subject, data_source, mask_added_tokens, stop_at, session.no, n_tries, total) |>
-	summarize(pr_correct = n()/total) |>
-	distinct() |>
+	summarize(pr_correct = n()) |>
 	ungroup() |>
+	mutate(pr_correct = pr_correct/total) |>
 	group_by(subject, data_source, mask_added_tokens, stop_at) |>
-	filter(
-		# dozen == max(dozen),
-		n_tries == min(n_tries)
-	) |>
+	filter(n_tries == min(n_tries)) |>
 	select(-n_tries, -total) |>
 	rename(pr_first_choice_correct = pr_correct)
 
@@ -146,7 +159,11 @@ feedback <- results |>
 	filter(element_name == 'feedback', item != 'Shift', parameter == 'Final') |>
 	select(subject, value) |>
 	rename(feedback = value) |>
-	mutate(feedback = gsub('%2C', ',', feedback))
+	mutate(
+		feedback = feedback |>
+			str_replace_all('%2C', ',') |>
+			str_replace_all('%0A', '\n')
+	)
 
 # organize results to one row per trial
 results <- results |> 
@@ -156,18 +173,18 @@ results <- results |>
 	) |> 
 	mutate(
 		parameter = case_when(
-						value %in% c('Start', 'End') ~ paste0(parameter, value),
-						TRUE 						 ~ parameter
-					),
+			value %in% c('Start', 'End') ~ paste0(parameter, value),
+			TRUE 						 ~ parameter
+		),
 		element_name = case_when(
-						element_name == 'dd'			~ 'response',
-						startsWith(parameter, '_Trial')	~ parameter,
-						TRUE 				 			~ element_name
-					),
+			element_name == 'dd'			~ 'response',
+			startsWith(parameter, '_Trial')	~ parameter,
+			TRUE 				 			~ element_name
+		),
 		value = case_when(
-					parameter %in% c('_Trial_Start', '_Trial_End') ~ as.character(event_time),
-					TRUE 										   ~ value
-				)
+			parameter %in% c('_Trial_Start', '_Trial_End') ~ as.character(event_time),
+			TRUE 										   ~ value
+		)
 	) |>
 	select(-parameter, -event_time, -order, -template) |>
 	pivot_wider(
@@ -192,18 +209,18 @@ results <- results |>
 # add experimental conditions
 results <- results |>
 	mutate(
-		condition 	= case_when(
-						grepl('_', args_group) 	~ 'experimental',
-						TRUE 					~ 'filler'
-					),
-		correct 	= case_when(
-						response == target_response ~ TRUE,
-						TRUE 						~ FALSE						
-					),
-		voice 		= case_when(
-						grepl('passive', sentence_type, fixed=TRUE) ~ 'OVS passive',
-						TRUE 										~ 'SVO active'
-					)
+		condition = case_when(
+			grepl('_', args_group) 	~ 'experimental',
+			TRUE 					~ 'filler'
+		),
+		correct = case_when(
+			response == target_response ~ TRUE,
+			TRUE 						~ FALSE
+		),
+		voice = case_when(
+			grepl('passive', sentence_type, fixed = TRUE) ~ 'OVS passive',
+			TRUE 										~ 'SVO active'
+		)
 	)
 
 # get unique item identifiers to add to the model results
@@ -253,12 +270,12 @@ py_run_string('from glob import glob')
 py_run_string('from tqdm import tqdm')
 py_run_string(
 	paste0(
-		'csvs += glob("D:/Users/mawilson/Yale backups/',
-		'CLAY Lab/salts/nv_tr_SVO-OSV_f_h_e/mob*/bv-ma-nmato/',
-		'**/*odds_ratios.csv.gz", recursive=True)'
+		'csvs = glob("D:/Users/mawilson/Yale backups/',
+		'CLAY Lab/salts/nv_tr_SVO-OSV_f_h_e/*cu*/bv-ma-nmato/',
+		'**/*odds_ratios.csv.gz", recursive = True)'
 	)
 )
-py_run_string('model_results = pd.concat([pd.read_csv(f) for f in tqdm(csvs)], ignore_index=True)')
+py_run_string('model_results = pd.concat([pd.read_csv(f) for f in tqdm(csvs)], ignore_index = True)')
 
 model.results <- py$model_results |> 
 	as_tibble() |>
@@ -311,7 +328,7 @@ model.results <- model.results |>
 		),
 		correct = odds_ratio > 0,
 		correct.pre.training = (odds_ratio - odds_ratio_pre_post_difference) > 0,
-		sentence = gsub('(\\D)(\\D+)', '\\U\\1\\L\\2', sentence, perl=TRUE),
+		sentence = gsub('(\\D)(\\D+)', '\\U\\1\\L\\2', sentence, perl = TRUE),
 		training = 'SVO+OSV',
 		seen_in_training = case_when(
 			token_type == 'tuning' ~ 'True',
@@ -325,7 +342,7 @@ model.results <- model.results |>
 		),
 		log.RT = NA_real_,
 		voice = case_when(
-			grepl('passive', sentence_type, fixed=TRUE) 		  ~ 'OVS passive',
+			grepl('passive', sentence_type, fixed = TRUE) 		  ~ 'OVS passive',
 			grepl('.*\\[obj\\].*\\[subj\\].*blorked.*', sentence) ~ 'OSV active',
 			TRUE 												  ~ 'SVO active'
 		),
@@ -387,15 +404,15 @@ results <- results |>
 		) |> 
 			fct_relevel('Subject target', 'Object target'),
 		args_group = paste(gsub('\\_', '+', args_group), 'args') |> 
-		fct_relevel(
-			'white+red args',
-			'break args', 
-			'buy args',
-			'drink args',
-			'eat args',
-			'read args',
-			'regret args'
-		),
+			fct_relevel(
+				'buildings+vehicles args',
+				'break args', 
+				'buy args',
+				'drink args',
+				'eat args',
+				'read args',
+				'regret args'
+			),
 		sentence_type = fct_relevel(
 			sentence_type,
 			'perfect transitive',
@@ -407,19 +424,19 @@ results <- results |>
 			'raising perfect passive',
 			'cleft subject perfect passive',
 			'neg perfect passive',
-			'cleft subject raising perfect passive',
-			'cleft object perfect transitive',
-			'presentational ORC perfect transitive'
+			'cleft subject raising perfect passive' #,
+			# 'cleft object perfect transitive',
+			# 'presentational ORC perfect transitive'
 		),
 		voice = case_when(
-			grepl('passive', sentence_type, fixed=TRUE) 		  ~ 'OVS passive',
-			grepl('.*\\[obj\\].*\\[subj\\].*blorked.*', sentence) ~ 'OSV active',
-			TRUE 												  ~ 'SVO active'
-		),
-		voice = fct_relevel(voice, 'SVO active', 'OVS passive', 'OSV active'),
+				grepl('passive', sentence_type, fixed = TRUE) 		  ~ 'OVS passive',
+				# grepl('.*\\[obj\\].*\\[subj\\].*blorked.*', sentence) ~ 'OSV active',
+				TRUE 												  ~ 'SVO active'
+			) |>
+			fct_relevel('SVO active', 'OVS passive'), #'OSV active'),
 		data_source = fct_relevel(data_source, 'human', 'BERT', 'ModernBERT Base', 'ModernBERT Large'),
-		mask_added_tokens = fct_relevel(mask_added_tokens, "Mask blork", "Don't mask blork"),
-		stop_at = fct_relevel(stop_at, '260 epochs', 'convergence')
+		mask_added_tokens = fct_relevel(mask_added_tokens, "Don't mask blork"), # "Mask blork", "Don't mask blork"),
+		stop_at = fct_relevel(stop_at, 'convergence') # '260 epochs', 'convergence')
 	)
 
 # exclude subjects less than <75% accurate on fillers (no stats)
@@ -477,8 +494,8 @@ purely.linear.by.arguments.both <- results |>
 		pass.correct = sum(correct[voice %like% 'passive']),
 	) |>
 	pivot_wider(
-		names_from=target_response, 
-		values_from=c(n_active, n_passive, inv.correct, pass.correct)
+		names_from = target_response, 
+		values_from = c(n_active, n_passive, inv.correct, pass.correct)
 	) |>
 	rowwise() |>
 	mutate(
@@ -486,7 +503,7 @@ purely.linear.by.arguments.both <- results |>
 							matrix(c(
 								inv.correct_subj, 	n_active_subj  - inv.correct_subj,
 								pass.correct_subj, 	n_passive_subj - pass.correct_subj
-						), ncol=2))$p.value,
+						), ncol = 2))$p.value,
 		# if both numbers are 0, it is indistinguishable from linear, 
 		# but chisq can't tell us that (it gives NaN)
 		# convert to a number (Inf) for ease of exclusion below
@@ -498,7 +515,7 @@ purely.linear.by.arguments.both <- results |>
 							matrix(c(
 								inv.correct_obj, 	n_active_obj  - inv.correct_obj,
 								pass.correct_obj, 	n_passive_obj - pass.correct_obj
-						), ncol=2))$p.value,
+						), ncol = 2))$p.value,
 		p.value.obj  = case_when(
 							is.na(p.value.obj) ~ Inf,
 							TRUE ~ p.value.obj
@@ -517,9 +534,9 @@ purely.linear.by.arguments.both <- results |>
 results <- results |>
 	mutate(
 		linear = case_when(
-					subject %in% purely.linear.by.arguments.both$subject ~ 'Linear',
-					TRUE ~ 'Non-linear'
-				)
+			subject %in% purely.linear.by.arguments.both$subject ~ 'Linear',
+			TRUE ~ 'Non-linear'
+		)
 	)
 
 # read in cosine similarity files for models
@@ -528,12 +545,12 @@ results <- results |>
 # predicts accuracy post-fine-tuning
 py_run_string(
 	paste0(
-		'cossim_csvs += glob("D:/Users/mawilson/Yale backups/',
-		'CLAY Lab/salts/nv_tr_SVO-OSV_f_h_e/mob*/bv-ma-nmato/',
-		'**/*cossims.csv.gz", recursive=True)'
+		'cossim_csvs = glob("D:/Users/mawilson/Yale backups/',
+		'CLAY Lab/salts/nv_tr_SVO-OSV_f_h_e/*cu*/bv-ma-nmato/',
+		'**/*cossims.csv.gz", recursive = True)'
 	)
 )
-py_run_string('cossim_results = pd.concat([pd.read_csv(f) for f in tqdm(cossim_csvs)], ignore_index=True)')
+py_run_string('cossim_results = pd.concat([pd.read_csv(f) for f in tqdm(cossim_csvs)], ignore_index = True)')
 
 cossim.results <- py$cossim_results |> 
 	as_tibble() |>
@@ -588,7 +605,7 @@ all.excluded.subjects <- c(
 		subject = as.factor(subject),
 		why = '',
 		why = case_when(
-				subject %in% less.than.90.on.training$subject ~ paste0(why, '<75% on training; '),
+				subject %in% less.than.90.on.training$subject ~ paste0(why, '<90% on training; '),
 				TRUE ~ why
 			),
 		why = case_when(
@@ -612,12 +629,12 @@ all.excluded.subjects <- c(
 	rename(why.excluded = why) |>
 	as_tibble()
 
-excluded.for.reasons.other.than.nonlinear <- all.excluded.subjects |>
+excluded.for.reasons.other.than.linear <- all.excluded.subjects |>
 	filter(why.excluded != 'n.d. from linear')
 
 full.results <- results
 results <- results |>
-	filter(!(subject %in% excluded.for.reasons.other.than.nonlinear$subject)) |>
+	filter(!(subject %in% excluded.for.reasons.other.than.linear$subject)) |>
 	droplevels()
 
 # split to separate data frames
@@ -672,8 +689,8 @@ f.scores <- exp |>
 	distinct() |>
 	pivot_longer(
 		c(f.score.subjects,f.score.objects),
-		names_to='target_response',
-		values_to='f.score'
+		names_to = 'target_response',
+		values_to = 'f.score'
 	) |>
 	mutate(
 		target_response = case_when(
@@ -731,8 +748,8 @@ f.scores.pre.training <- exp |>
 	distinct() |> 
 	pivot_longer(
 		c(f.score.subjects,f.score.objects),
-		names_to='target_response',
-		values_to='f.score'
+		names_to = 'target_response',
+		values_to = 'f.score'
 	) |>
 	mutate(
 		target_response = case_when(
@@ -756,7 +773,6 @@ exp <- exp |>
 # save results for accuracy analysis
 accuracy.data <- exp |>
 	filter(
-		data_source %in% c('human', 'BERT'),
 		mask_added_tokens == "Don't mask blork",
 		stop_at == 'convergence',
 		# filter to only the actual sentences humans saw
@@ -777,21 +793,21 @@ accuracy.data <- exp |>
 	) |>
 	mutate(
 		target_response.n = case_when(
-								target_response == 'Object target'  ~  0.5,
-								target_response == 'Subject target' ~ -0.5
-							),
+			target_response == 'Object target'  ~  0.5,
+			target_response == 'Subject target' ~ -0.5
+		),
 		data_source.n = case_when(
-							data_source == 'human' ~  0.5,
-							data_source == 'BERT'  ~ -0.5
-						),
+			data_source == 'human' ~  0.5,
+			data_source %in% c('BERT', 'ModernBERT Base', 'ModernBERT Large') ~ -0.5
+		),
 		voice.n = case_when(
-					voice == 'SVO active'  ~  0.5,
-					voice == 'OVS passive' ~ -0.5
-				),
+			voice == 'SVO active'  ~  0.5,
+			voice == 'OVS passive' ~ -0.5
+		),
 		RT = exp(log.RT)
 	)
 
-write.csv(accuracy.data, 'accuracy-data.csv', row.names=FALSE)
+write.csv(accuracy.data, 'accuracy-data.csv', row.names = FALSE)
 
 # logistic regression including data source 
 # separate regressions for each argument group
@@ -813,72 +829,77 @@ write.csv(accuracy.data, 'accuracy-data.csv', row.names=FALSE)
 # maybe exclude nouns where subjects < 100% on training structure got it wrong?
 
 linear_labels <- geom_text(
-		data = (
-			exp |> 
-				select(subject, data_source, mask_added_tokens, stop_at, linear) |>
-				distinct() |>
-				group_by(data_source, mask_added_tokens, stop_at, linear) |> 
-				summarize(count=sprintf("n=%02d", n()))
-		),
-		mapping = aes(x=-Inf, y=-Inf, label=count),
-		hjust=-0.5,
-		vjust=-1,
-		inherit.aes=FALSE
-	)
+	data = exp |> 
+		select(subject, data_source, mask_added_tokens, stop_at, linear) |>
+		distinct() |>
+		group_by(data_source, mask_added_tokens, stop_at, linear) |> 
+		summarize(count = sprintf("n=%02d", n())),
+	mapping = aes(x = -Inf, y = -Inf, label = count),
+	hjust = -0.625,
+	vjust = -1,
+	inherit.aes = FALSE
+)
 
 linear_labels_no_humans <- geom_text(
-		data = (
-			exp |> 
-				filter(data_source != 'human') |>
-				select(subject, data_source, mask_added_tokens, stop_at, linear) |>
-				distinct() |>
-				group_by(data_source, mask_added_tokens, stop_at, linear) |> 
-				summarize(count=sprintf("n=%02d", n()))
-		),
-		mapping = aes(x=-Inf, y=-Inf, label=count),
-		hjust=-0.5,
-		vjust=-1,
-		inherit.aes=FALSE
-	)
+	data = (
+		exp |> 
+			filter(data_source != 'human') |>
+			select(subject, data_source, mask_added_tokens, stop_at, linear) |>
+			distinct() |>
+			group_by(data_source, mask_added_tokens, stop_at, linear) |> 
+			summarize(count = sprintf("n=%02d", n()))
+	),
+	mapping = aes(x=-Inf, y=-Inf, label = count),
+	hjust=-0.5,
+	vjust=-1,
+	inherit.aes = FALSE
+)
 
 linear_labels_humans <- geom_text(
-		data = (
-			exp |> 
-				filter(data_source == 'human') |>
-				select(subject, linear) |>
-				distinct() |>
-				group_by(linear) |> 
-				summarize(count=sprintf("n=%02d", n()))
-		),
-		mapping = aes(x=-Inf, y=-Inf, label=count),
-		hjust=-0.5,
-		vjust=-1,
-		inherit.aes=FALSE
-	)
+	data = (
+		exp |> 
+			filter(data_source == 'human') |>
+			select(subject, linear) |>
+			distinct() |>
+			group_by(linear) |> 
+			summarize(count = sprintf("n=%02d", n()))
+	),
+	mapping = aes(x=-Inf, y=-Inf, label = count),
+	hjust=-0.5,
+	vjust=-1,
+	inherit.aes = FALSE
+)
 
 ########################################################################
 ###################### EXPERIMENTAL ITEMS ##############################
 ########################################################################
 # accuracy by voice, target_response, and data_source
 exp |> 
-	mutate(data_source = case_when(data_source == 'human' ~ 'People', TRUE ~ 'BERT (fine-tuned)')) |>
+	mutate(
+		data_source = case_when(
+			data_source == 'human' ~ 'People', 
+			TRUE ~ paste0(data_source, ' (fine-tuned)')
+		)
+	) |>
 	select(-correct.pre.training) |>
 	rbind(
 		exp |> 
-			filter(data_source == 'BERT') |>
+			filter(data_source != 'human') |>
 			select(-correct) |> 
 			droplevels() |>
 			rename(correct = correct.pre.training) |>
-			mutate(data_source = 'BERT (pre-fine-tuning)')
+			mutate(data_source = paste0(data_source, ' (pre-fine-tuning)'))
 	) |>
-	mutate(data_source = fct_relevel(data_source, 'People', 'BERT (fine-tuned)', 'BERT (pre-fine-tuning)')) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	stat_summary(fun=mean, geom='bar', position='dodge', width=0.9, color = 'black') +
-	stat_summary(fun.data=beta_ci, geom='errorbar', width=0.33, position=position_dodge(0.9)) +
-	# stat_summary(
-	# 	fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-	# 	geom='label', position=position_dodge(0.9), show.legend=FALSE
-	# ) +
+	mutate(
+		data_source = fct_relevel(data_source, 
+			'People', 'BERT (fine-tuned)', 'BERT (pre-fine-tuning)',
+			'ModernBERT Base (fine-tuned)', 'ModernBERT Base (pre-fine-tuning)',
+			'ModernBERT Large (fine-tuned)', 'ModernBERT Large (pre-fine-tuning)'
+		)
+	) |>
+	ggplot(aes(x = voice, y = as.numeric(correct), fill = target_response)) +
+	stat_summary(fun = mean, geom = 'bar', position = 'dodge', width = 0.9, color = 'black') +
+	stat_summary(fun.data = beta_ci, geom = 'errorbar', width = 0.33, position = position_dodge(0.9)) +
 	ylim(0, 1) +
 	scale_x_discrete(
 		'Voice',
@@ -886,45 +907,25 @@ exp |>
 		labels = c('Active', 'Passive', '(OSV)')
 	) +
 	ylab('Pr. Correct') +
-	scale_fill_manual(
+	scale_fill_discrete(
 		'Underlying role',
 		breaks = c('Subject target', 'Object target'),
-		labels = c('White-colored nouns (subjects)', 'Red-colored nouns (objects)'),
-		values = c('#ffffff', '#ef756a')
+		labels = c('Buildings (subjects)', 'Vehicles (objects')
 	) +
-	ggtitle(paste0('Pr. Correct by Voice (white subjects; red objects)')) +
+	ggtitle(paste0('Pr. Correct by Voice (building subjects; vehicle objects)')) +
 	facet_grid(. ~ data_source)
-	
-# accuracy by voice, target_response, and data_source (subject means)
-exp |> 
-	group_by(subject, data_source, mask_added_tokens, stop_at, voice, target_response) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	geom_point(
-		shape=21,
-		cex=2,
-		position=position_jitterdodge(dodge.width=0.9, jitter.width=0.45, jitter.height=0.0)
-	) +
-	geom_violin(alpha=0.3) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (subject means)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at)
 
 # accuracy by voice, target_response, data_source, and linear
 exp |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	stat_summary(fun=mean, geom='bar', position='dodge', width=0.9) +
-	stat_summary(fun.data=beta_ci, geom='errorbar', width=0.33, position=position_dodge(0.9)) +
+	ggplot(aes(x = voice, y = as.numeric(correct), fill = target_response)) +
+	stat_summary(fun = mean, geom = 'bar', position = 'dodge', width = 0.9, color = 'black') +
 	stat_summary(
-		fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-		geom='label', position=position_dodge(0.9), show.legend=FALSE
+		fun.data = beta_ci, geom = 'errorbar', width = 0.33, 
+		position = position_dodge(0.9)
+	) +
+	stat_summary(
+		fun.data = \(y) data.frame(y = mean(y), label = sprintf('%.2f', mean(y)), fill = 'white'), 
+		geom = 'label', position = position_dodge(0.9), show.legend = FALSE, size = 3
 	) +
 	linear_labels + 
 	ylim(0, 1) +
@@ -940,472 +941,34 @@ exp |>
 		labels = c('Subject target', 'Object target')
 	) +
 	ggtitle(paste0('Pr. Correct by Voice')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at + linear)
+	facet_grid(linear ~ data_source)
 
-# mean accuracy/subject by voice, target_response, data_source, and linear
-exp |> 
-	group_by(subject, data_source, mask_added_tokens, stop_at, linear, voice, target_response) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	geom_boxplot(position='dodge', width=0.9) +
-	linear_labels + 
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct (means)') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (subject means)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at + linear)
-
-# log RT by subject, data_source, linear, voice, and target_response
-exp |> 
-	filter(
-		data_source == 'human',
-		log.RT < log(MAX_RT_IN_SECONDS*1000)
-	) |>
+ranks <- full.results |>
+	filter(data_source == 'human') |>
 	group_by(subject) |>
-	mutate(sd.log.RT = sd(log.RT)) |>
-	filter(
-		log.RT < mean(log.RT) + (OUTLIER_RT_SDS * sd.log.RT), 
-		log.RT > mean(log.RT) - (OUTLIER_RT_SDS * sd.log.RT)
+	summarize(median = median(log.RT)) |>
+	arrange(median) |>
+	ungroup() |>
+	mutate(rank = seq_len(n()))
+
+full.results |>
+	left_join(ranks |> select(-median)) |>
+	filter(data_source == 'human') |>
+	mutate(
+		excluded = subject %in% unique(excluded.for.reasons.other.than.linear$subject)
 	) |>
-	ungroup() |> 
-	ggplot(aes(x=voice, y=log.RT, fill=target_response)) +
-	geom_boxplot() +
-	linear_labels_humans +
+	ggplot(aes(x = as.factor(rank), y = log.RT, fill = excluded, pattern = linear)) +
+	geom_boxplot_pattern(
+		color = "black", 
+	   pattern_fill = "black",
+	   pattern_angle = 45,
+	   pattern_density = 0.1,
+	   pattern_spacing = 0.025,
+	   pattern_key_scale_factor = 0.6
+	) +
 	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Log RT') +
-	scale_fill_discrete('Target response') +
-	ggtitle(sprintf('Log RT by Voice (>%s sec and >%s s.d. from mean by subject removed)', MAX_RT_IN_SECONDS, OUTLIER_RT_SDS)) +
-	facet_grid(. ~ linear)
-
-# mean log RT by subject, data_source, linear, voice, and target_response
-exp |> 
-	filter(
-		data_source == 'human',
-		log.RT < log(MAX_RT_IN_SECONDS*1000)
-	) |>
-	group_by(subject) |>
-	mutate(sd.log.RT = sd(log.RT)) |>
-	filter(
-		log.RT < mean(log.RT) + (OUTLIER_RT_SDS * sd.log.RT), 
-		log.RT > mean(log.RT) - (OUTLIER_RT_SDS * sd.log.RT)
-	) |>
-	group_by(subject, data_source, linear, voice, target_response) |>
-	summarize(log.RT = mean(log.RT)) |>
-	ggplot(aes(x=voice, y=log.RT, fill=target_response)) +
-	geom_boxplot() +
-	linear_labels_humans +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Log RT (means)') +
-	scale_fill_discrete('Target response') +
-	ggtitle(sprintf('Log RT by Voice (subject means, >%s sec and >%s s.d. by subject removed)', MAX_RT_IN_SECONDS, OUTLIER_RT_SDS)) +
-	facet_grid(. ~ linear)
-
-# F scores/subject by data_source, linear, voice, and target_response
-exp |> 
-	select(
-		subject, data_source, mask_added_tokens, 
-		stop_at, voice, target_response, linear, f.score
-	) |>
-	distinct() |>
-	mutate(f.score = case_when(is.na(f.score) ~ 0, TRUE ~ f.score)) |>
-	ggplot(aes(x=voice, y=f.score, fill=target_response)) +
-	geom_boxplot(position='dodge', width=0.9) +
-	linear_labels + 
-	# geom_violin(position='dodge', width=0.9, alpha=0.3) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('F score') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Subject F scores by Voice')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at + linear)
-
-# mean accuracy by mean cosine similarity to targets (models only)
-exp |>
-	filter(!is.na(mean_cossim_to_targets)) |>
-	droplevels() |>
-	group_by(subject, data_source, voice, target_response, mean_cossim_to_targets, mask_added_tokens, stop_at) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=mean_cossim_to_targets, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	ylim(0, 1) +
-	xlab('Mean cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by mean cosine similarity to blorked targets')) +
-	facet_grid2(data_source ~ mask_added_tokens + stop_at + voice + target_response, scales='free_x', independent='x')
-
-# mean accuracy by mean cosine similarity to targets (models only) and linear
-exp |>
-	filter(!is.na(mean_cossim_to_targets)) |>
-	droplevels() |>
-	group_by(subject, data_source, voice, target_response, mean_cossim_to_targets, linear, mask_added_tokens, stop_at) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=mean_cossim_to_targets, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	ylim(0, 1) +
-	xlab('Mean cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by mean cosine similarity to blorked targets')) +
-	facet_grid2(data_source ~ mask_added_tokens + stop_at + linear + voice + target_response, scales='free_x', independent='x')
-
-# mean accuracy by max cosine similarity to targets (models only)
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	group_by(subject, data_source, voice, target_response, max_cossim_to_targets, mask_added_tokens, stop_at) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=max_cossim_to_targets, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Max cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by max cosine similarity to blorked targets')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + voice,
-		scales='free_x', independent='x'
-	)
-
-# mean accuracy by max cosine similarity to targets (models only) and linear
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	group_by(
-		subject, data_source, voice, target_response, 
-		max_cossim_to_targets, linear, mask_added_tokens, stop_at
-	) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=max_cossim_to_targets, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Max cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by max cosine similarity to blorked targets')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + linear + voice, 
-		scales='free_x', independent='x'
-	)
-
-# mean accuracy by mean cosine similarity difference to targets (models only)
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	mutate(mean_cossim_to_targets = mean_cossim_to_targets - mean_cossim_to_targets_pre.training) |>
-	group_by(subject, data_source, voice, target_response, mean_cossim_to_targets, mask_added_tokens, stop_at) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=mean_cossim_to_targets, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Difference in mean cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by difference in mean cosine similarity to blorked targets')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + voice,
-		scales='free_x', independent='x'
-	)
-
-# mean accuracy by mean cosine similarity difference to targets (models only) and linear
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	mutate(mean_cossim_to_targets = mean_cossim_to_targets - mean_cossim_to_targets_pre.training) |>
-	group_by(
-		subject, data_source, voice, target_response, 
-		mean_cossim_to_targets, linear, mask_added_tokens, stop_at
-	) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=mean_cossim_to_targets, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Difference in mean cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by difference in mean cosine similarity to blorked targets')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + linear + voice, 
-		scales='free_x', independent='x'
-	)
-
-# mean accuracy by max cosine similarity difference to targets (models only)
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	mutate(max_cossim_to_targets = max_cossim_to_targets - max_cossim_to_targets_pre.training) |>
-	group_by(subject, data_source, voice, target_response, max_cossim_to_targets, mask_added_tokens, stop_at) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=max_cossim_to_targets, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Difference in max cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by difference in max cosine similarity to blorked targets')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + voice,
-		scales='free_x', independent='x'
-	)
-
-# mean accuracy by max cosine similarity difference to targets (models only) and linear
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	mutate(max_cossim_to_targets = max_cossim_to_targets - max_cossim_to_targets_pre.training) |>
-	group_by(
-		subject, data_source, voice, target_response, 
-		max_cossim_to_targets, linear, mask_added_tokens, stop_at
-	) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=max_cossim_to_targets, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Difference in max cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by difference in max cosine similarity to blorked targets')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + linear + voice, 
-		scales='free_x', independent='x'
-	)
-
-########################################################################
-###################### PRE-FINE-TUNING (MODELS ONLY) ###################
-########################################################################
-# pre-fine-tuning accuracy by voice, target_response, and data_source
-exp |> 
-	filter(data_source == 'BERT') |>
-	select(-correct) |> 
-	droplevels() |>
-	rename(correct = correct.pre.training) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	stat_summary(fun=mean, geom='bar', position='dodge', width=0.9) +
-	stat_summary(fun.data=beta_ci, geom='errorbar', width=0.33, position=position_dodge(0.9)) +
-	stat_summary(
-		fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-		geom='label', position=position_dodge(0.9), show.legend=FALSE
-	) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (pre-fine-tuning)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at)
-	
-# pre-fine-tuning accuracy by voice, target_response, and data_source (subject means)
-exp |> 
-	filter(data_source != 'human') |>
-	select(-correct) |> 
-	droplevels() |>
-	rename(correct = correct.pre.training) |>
-	group_by(subject, data_source, mask_added_tokens, stop_at, voice, target_response) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	geom_point(
-		shape=21,
-		cex=2,
-		position=position_jitterdodge(dodge.width=0.9, jitter.width=0.45, jitter.height=0.0)
-	) +
-	geom_violin(alpha=0.3) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (subject means, pre-fine-tuning)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at)
-
-# pre-fine-tuning accuracy by voice, target_response, data_source, and linear
-exp |>
-	filter(data_source != 'human') |>
-	select(-correct) |> 
-	droplevels() |>
-	rename(correct = correct.pre.training) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	stat_summary(fun=mean, geom='bar', position='dodge', width=0.9) +
-	stat_summary(fun.data=beta_ci, geom='errorbar', width=0.33, position=position_dodge(0.9)) +
-	stat_summary(
-		fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-		geom='label', position=position_dodge(0.9), show.legend=FALSE
-	) +
-	linear_labels_no_humans + 
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete(
-		'Target response',
-		breaks = c('Subject target', 'Object target'),
-		labels = c('Subject target', 'Object target')
-	) +
-	ggtitle(paste0('Pr. Correct by Voice (pre-fine-tuning)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at + linear)
-
-# pre-fine-tuning mean accuracy/subject by voice, target_response, data_source, and linear
-exp |> 
-	filter(data_source != 'human') |>
-	select(-correct) |> 
-	droplevels() |>
-	rename(correct = correct.pre.training) |>
-	group_by(subject, data_source, mask_added_tokens, stop_at, linear, voice, target_response) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	geom_boxplot(position='dodge', width=0.9) +
-	linear_labels_no_humans + 
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct (means)') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (subject means, pre-fine-tuning)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at + linear)
-
-# F scores pretraining/subject by data_source, linear, voice, and target_response
-exp |> 
-	filter(data_source != 'human') |>
-	droplevels() |>
-	select(-f.score) |>
-	rename(f.score = f.score.pre.training) |>
-	select(
-		subject, data_source, mask_added_tokens, 
-		stop_at, voice, target_response, linear, f.score
-	) |>
-	distinct() |>
-	mutate(f.score = case_when(is.na(f.score) ~ 0, TRUE ~ f.score)) |>
-	ggplot(aes(x=voice, y=f.score, fill=target_response)) +
-	geom_boxplot(position='dodge', width=0.9) +
-	linear_labels_no_humans + 
-	# geom_violin(position='dodge', width=0.9, alpha=0.3) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('F score') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Subject F scores by Voice (pre-fine-tuning)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at + linear)
-
-# mean accuracy by mean cosine similarity to targets (models only)
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	group_by(subject, data_source, voice, target_response, mean_cossim_to_targets_pre.training, mask_added_tokens, stop_at) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=mean_cossim_to_targets_pre.training, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Mean cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by mean cosine similarity to blorked targets (pre-fine-tuning)')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + voice,
-		scales='free_x', independent='x'
-	)
-
-# mean accuracy by mean cosine similarity to targets (models only) and linear
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	group_by(
-		subject, data_source, voice, target_response, 
-		mean_cossim_to_targets_pre.training, linear, mask_added_tokens, stop_at
-	) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=mean_cossim_to_targets.pre.training, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Mean cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by mean cosine similarity to blorked targets (pre-fine-tuning)')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + linear + voice, 
-		scales='free_x', independent='x'
-	)
-
-# mean accuracy by max cosine similarity to targets (models only)
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	group_by(subject, data_source, voice, target_response, max_cossim_to_targets_pre.training, mask_added_tokens, stop_at) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=max_cossim_to_targets_pre.training, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Max cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by max cosine similarity to blorked targets (pre-fine-tuning)')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + voice,
-		scales='free_x', independent='x'
-	)
-
-# mean accuracy by max cosine similarity to targets (models only) and linear
-exp |>
-	filter(data_source != 'human', stop_at == 'convergence', mask_added_tokens == "Don't mask blork") |>
-	droplevels() |>
-	group_by(
-		subject, data_source, voice, target_response, 
-		max_cossim_to_targets_pre.training, linear, mask_added_tokens, stop_at
-	) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=max_cossim_to_targets, y=as.numeric(correct), fill=target_response)) +
-	geom_point(shape=21, cex=2) +
-	geom_smooth(method='lm') +
-	expand_limits(y=c(0,1)) +
-	xlab('Max cosine similarity to best targets for blorked (determined pre-fine-tuning)') +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by max cosine similarity to blorked targets (pre-fine-tuning)')) +
-	facet_grid2(
-		data_source ~ mask_added_tokens + stop_at + linear + voice, 
-		scales='free_x', independent='x'
+		breaks = as.factor(ranks$rank),
+		labels = ranks$subject
 	)
 
 ########################################################################
@@ -1414,31 +977,31 @@ exp |>
 
 # accuracy by voice, target_response, and data_source
 filler |> 
-	filter(
-		mask_added_tokens == "Don't mask blork", 
-		stop_at == 'convergence',
-		data_source %in% c('human', 'BERT')# ,
-		# !subject %in% all.excluded.subjects$subject
+	mutate(
+		data_source = case_when(
+			data_source == 'human' ~ 'People', 
+			TRUE ~ paste0(data_source, ' (fine-tuned)')
+		)
 	) |>
-	mutate(data_source = case_when(data_source == 'human' ~ 'People', TRUE ~ 'BERT (fine-tuned)')) |>
 	select(-correct.pre.training) |>
 	rbind(
 		filler |> 
-			filter(data_source == 'BERT') |>
+			filter(data_source != 'human') |>
 			select(-correct) |> 
 			droplevels() |>
 			rename(correct = correct.pre.training) |>
-			mutate(data_source = 'BERT (pre-fine-tuning)')
+			mutate(data_source = paste0(data_source, ' (pre-fine-tuning)'))
 	) |>
-	mutate(data_source = fct_relevel(data_source, 'People', 'BERT (fine-tuned)', 'BERT (pre-fine-tuning)')) |>
-	
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	stat_summary(fun=mean, geom='bar', position='dodge', width=0.9) +
-	stat_summary(fun.data=beta_ci, geom='errorbar', width=0.33, position=position_dodge(0.9)) +
-	# stat_summary(
-	# 	fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-	# 	geom='label', position=position_dodge(0.9), show.legend=FALSE
-	# ) +
+	mutate(
+		data_source = fct_relevel(data_source, 
+			'People', 'BERT (fine-tuned)', 'BERT (pre-fine-tuning)',
+			'ModernBERT Base (fine-tuned)', 'ModernBERT Base (pre-fine-tuning)',
+			'ModernBERT Large (fine-tuned)', 'ModernBERT Large (pre-fine-tuning)'
+		)
+	) |>
+	ggplot(aes(x = voice, y = as.numeric(correct), fill = target_response)) +
+	stat_summary(fun = mean, geom = 'bar', position = 'dodge', width = 0.9, color = 'black') +
+	stat_summary(fun.data = beta_ci, geom = 'errorbar', width = 0.33, position = position_dodge(0.9)) +
 	ylim(0, 1) +
 	scale_x_discrete(
 		'Voice',
@@ -1451,531 +1014,31 @@ filler |>
 		breaks = c('Subject target', 'Object target'),
 		labels = c('Subject', 'Object')
 	) +
-	ggtitle(paste0('Pr. Correct by Voice (fillers for white subjects; red objects)')) +
-	# facet_grid(data_source ~ mask_added_tokens + stop_at)
+	ggtitle(paste0('Pr. Correct by Voice (fillers for building subjects; vehicle objects)')) +
 	facet_grid(. ~ data_source)
-
-# accuracy by voice, target_response, and data_source (subject means)
-filler |> 
-	group_by(subject, data_source, mask_added_tokens, stop_at, voice, target_response) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	geom_point(
-		shape=21,
-		cex=2,
-		position=position_jitterdodge(dodge.width=0.9, jitter.width=0.45, jitter.height=0.0)
-	) +
-	geom_violin(alpha=0.3) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (subject means, fillers)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at)
-
-# accuracy by voice, target_response, data_source, and linear
-filler |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	stat_summary(fun=mean, geom='bar', position='dodge', width=0.9) +
-	stat_summary(fun.data=beta_ci, geom='errorbar', width=0.33, position=position_dodge(0.9)) +
-	stat_summary(
-		fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-		geom='label', position=position_dodge(0.9), show.legend=FALSE
-	) +
-	linear_labels + 
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete(
-		'Target response',
-		breaks = c('Subject target', 'Object target'),
-		labels = c('Subject target', 'Object target')
-	) +
-	ggtitle(paste0('Pr. Correct by Voice (fillers)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at + linear)
-
-# mean accuracy/subject by voice, target_response, data_source, and linear
-filler |> 
-	group_by(subject, data_source, mask_added_tokens, stop_at, linear, voice, target_response) |>
-	summarize(correct = mean(correct)) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	geom_boxplot(position='dodge', width=0.9) +
-	linear_labels + 
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct (means)') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (subject means, fillers)')) +
-	facet_grid(data_source ~ mask_added_tokens + stop_at + linear)
-
-# log RT by subject, data_source, linear, voice, and target_response
-filler |> 
-	filter(
-		data_source == 'human',
-		log.RT < log(MAX_RT_IN_SECONDS*1000)
-	) |>
-	group_by(subject) |>
-	mutate(sd.log.RT = sd(log.RT)) |>
-	filter(
-		log.RT < mean(log.RT) + (OUTLIER_RT_SDS * sd.log.RT), 
-		log.RT > mean(log.RT) - (OUTLIER_RT_SDS * sd.log.RT)
-	) |>
-	ungroup() |>
-	ggplot(aes(x=voice, y=log.RT, fill=target_response)) +
-	geom_boxplot() +
-	linear_labels_humans +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Log RT') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Log RT by Voice (>3 s.d. by subject removed, fillers)')) +
-	facet_grid(. ~ linear)
-
-# mean log RT by subject, data_source, linear, voice, and target_response
-filler |> 
-	filter(
-		data_source == 'human',
-		log.RT < log(MAX_RT_IN_SECONDS*1000)
-	) |>
-	group_by(subject) |>
-	mutate(sd.log.RT = sd(log.RT)) |>
-	filter(
-		log.RT < mean(log.RT) + (OUTLIER_RT_SDS * sd.log.RT), 
-		log.RT > mean(log.RT) - (OUTLIER_RT_SDS * sd.log.RT)
-	) |>
-	group_by(subject, data_source, linear, voice, target_response) |>
-	summarize(log.RT = mean(log.RT)) |>
-	ggplot(aes(x=voice, y=log.RT, fill=target_response)) +
-	geom_boxplot() +
-	linear_labels_humans +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Log RT (means)') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Log RT by Voice (subject means, >3 s.d. by subject removed, fillers)')) +
-	facet_grid(. ~ linear)
-	
-# accuracy by voice, target_response, and data_source pre-fine-tuning
-filler |> 
-	filter(data_source != 'human') |>
-	droplevels() |>
-	select(-correct) |>
-	rename(correct = correct.pre.training) |> 
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	stat_summary(fun=mean, geom='bar', position='dodge', width=0.9) +
-	stat_summary(fun.data=beta_ci, geom='errorbar', width=0.33, position=position_dodge(0.9)) +
-	stat_summary(
-		fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-		geom='label', position=position_dodge(0.9), show.legend=FALSE
-	) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (pre-fine-tuning, fillers)')) +
-	facet_grid(data_source ~ .)
 
 ########################################################################
 ###################### MOST RECENT SUBJECTS ############################
 ########################################################################
-# accuracy
-exp |> 
-	s_mr() |>
-	mutate(
-		included = case_when(
-			subject %in% excluded.for.reasons.other.than.nonlinear$subject ~ 'Excluded',
-			TRUE ~ 'Included'
-		)
-	) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	stat_summary(fun=mean, geom='bar', position='dodge', width=0.9) +
-	stat_summary(fun.data=beta_ci, geom='errorbar', width=0.33, position=position_dodge(0.9)) +
-	stat_summary(
-		fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-		geom='label', position=position_dodge(0.9), show.legend=FALSE
-	) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (', MOST_RECENT_SUBJECTS[[1]], '–', MOST_RECENT_SUBJECTS[[length(MOST_RECENT_SUBJECTS)]], ')')) +
-	facet_grid(. ~ paste0(subject, ' (', included, ')') + linear)
-
-# log RTs
-exp |> 
-	s_mr() |>
-	mutate(
-		included = case_when(
-			subject %in% excluded.for.reasons.other.than.nonlinear$subject ~ 'Excluded',
-			TRUE ~ 'Included'
-		)
-	) |>
-	filter(
-		data_source == 'human',
-		log.RT < log(MAX_RT_IN_SECONDS*1000)
-	) |>
-	group_by(subject) |>
-	mutate(sd.log.RT = sd(log.RT)) |>
-	filter(
-		log.RT < mean(log.RT) + (OUTLIER_RT_SDS * sd.log.RT), 
-		log.RT > mean(log.RT) - (OUTLIER_RT_SDS * sd.log.RT)
-	) |>
-	ungroup() |> 
-	ggplot(aes(x=voice, y=log.RT, fill=target_response)) +
-	geom_boxplot() +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Log RT') +
-	scale_fill_discrete('Target response') +
-	ggtitle(
-		paste0(
-			sprintf('Log RT by Voice (>%s sec and >%s s.d. from mean by subject removed)', MAX_RT_IN_SECONDS, OUTLIER_RT_SDS), 
-			' (', 
-			MOST_RECENT_SUBJECTS[[1]], 
-			'–', 
-			MOST_RECENT_SUBJECTS[[length(MOST_RECENT_SUBJECTS)]], 
-			')'
-		)
-	) +
-	facet_grid(. ~ paste0(subject, ' (', included, ')') + linear)
-
 # accuracy by session in training
 training.accuracy.by.session.no |>
 	mutate(session.no = as.factor(session.no)) |>
 	complete(session.no) |>
-	s_mr() |>
 	mutate(
 		included = case_when(
-			subject %in% excluded.for.reasons.other.than.nonlinear$subject ~ 'Excluded',
+			subject %in% excluded.for.reasons.other.than.linear$subject ~ 'Excluded',
 			TRUE ~ 'Included'
 		)
 	) |>
-	ggplot(aes(x=session.no, y=pr_first_choice_correct)) +
-	geom_bar(stat='identity') +
+	ggplot(aes(x = session.no, y = pr_first_choice_correct)) +
+	geom_bar(stat = 'identity') +
 	facet_grid(. ~ paste0(subject, ' (', included, ')')) +
 	xlab('Session No.') +
 	ylab('Pr. of trials where first choice was correct') +
-	expand_limits(y=c(0,1)) +
-	geom_hline(yintercept=0.9, linetype='dashed', alpha=0.5) +
+	expand_limits(y = c(0, 1)) +
+	geom_hline(yintercept = 0.9, linetype = 'dashed', alpha = 0.5) +
 	ggtitle('Subject performance in training phase') +
 	stat_summary(
-		fun.data=\(y) data.frame(y=y, label=sprintf('%.2f', y), fill='white'),
-		geom='label', show.legend=FALSE
+		fun.data = \(y) data.frame(y = y, label = sprintf('%.2f', y), fill = 'white'),
+		geom = 'label', show.legend = FALSE
 	)
-
-###################### FILLERS ########################################
-# accuracy
-filler |> 
-	s_mr() |>
-	mutate(
-		included = case_when(
-			subject %in% excluded.for.reasons.other.than.nonlinear$subject ~ 'Excluded',
-			TRUE ~ 'Included'
-		)
-	) |>
-	ggplot(aes(x=voice, y=as.numeric(correct), fill=target_response)) +
-	stat_summary(fun=mean, geom='bar', position='dodge', width=0.9) +
-	stat_summary(fun.data=beta_ci, geom='errorbar', width=0.33, position=position_dodge(0.9)) +
-	stat_summary(
-		fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-		geom='label', position=position_dodge(0.9), show.legend=FALSE
-	) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete('Target response') +
-	ggtitle(paste0('Pr. Correct by Voice (fillers) (', MOST_RECENT_SUBJECTS[[1]], '–', MOST_RECENT_SUBJECTS[[length(MOST_RECENT_SUBJECTS)]], ')')) +
-	facet_grid(. ~ paste0(subject, ' (', included, ')') + linear)
-
-# log RTs
-filler |> 
-	s_mr() |>
-	mutate(
-		included = case_when(
-			subject %in% excluded.for.reasons.other.than.nonlinear$subject ~ 'Excluded',
-			TRUE ~ 'Included'
-		)
-	) |>
-	filter(
-		data_source == 'human',
-		log.RT < log(MAX_RT_IN_SECONDS*1000)
-	) |>
-	group_by(subject) |>
-	mutate(sd.log.RT = sd(log.RT)) |>
-	filter(
-		log.RT < mean(log.RT) + (OUTLIER_RT_SDS * sd.log.RT), 
-		log.RT > mean(log.RT) - (OUTLIER_RT_SDS * sd.log.RT)
-	) |>
-	ungroup() |>
-	ggplot(aes(x=voice, y=log.RT, fill=target_response)) +
-	geom_boxplot() +
-	scale_x_discrete(
-		'Template',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('SVO', 'OVS', '(OSV)')
-	) +
-	ylab('Log RT') +
-	scale_fill_discrete('Target response') +
-	ggtitle(
-		paste0(
-			'Log RT by Voice (>3 s.d. by subject removed, fillers) (', 
-			MOST_RECENT_SUBJECTS[[1]], 
-			'–', 
-			MOST_RECENT_SUBJECTS[[length(MOST_RECENT_SUBJECTS)]], 
-			')'
-		)
-	) +
-	facet_grid(. ~ paste0(subject, ' (', included, ')') + linear)
-	
-# AD HOC
-exp |> 
-	filter(
-		mask_added_tokens == "Don't mask blork", 
-		stop_at == 'convergence',
-		data_source %in% c('human', 'BERT', 'ModernBERT Base', 'ModernBERT Large')
-	) |>
-	mutate(data_source = case_when(data_source == 'human' ~ 'People', TRUE ~ paste0(data_source, '\n(fine-tuned)'))) |>
-	select(-correct.pre.training) |>
-	rbind(
-		exp |> 
-			filter(data_source %in% c('BERT', 'ModernBERT Base', 'ModernBERT Large')) |>
-			select(-correct) |> 
-			droplevels() |>
-			rename(correct = correct.pre.training) |>
-			mutate(data_source = paste0(data_source, '\n(pre-fine-tuning)'))
-	) |>
-	mutate(
-		data_source = fct_relevel(
-			data_source, 'People', 'BERT\n(fine-tuned)', 'BERT\n(pre-fine-tuning)', 
-			'ModernBERT Base\n(fine-tuned)', 'ModernBERT Base\n(pre-fine-tuning)',
-			'ModernBERT Large\n(fine-tuned)', 'ModernBERT Large\n(pre-fine-tuning)'
-		),
-		linear = paste0(linear, ' participant/model')
-	) |>
-	ggplot(aes(x = voice, y = as.numeric(correct), fill = target_response)) +
-	stat_summary(fun = mean, geom = 'bar', position = 'dodge', width = 0.9, color = 'black') +
-	stat_summary(fun.data = beta_ci, geom = 'errorbar', width = 0.33, position = position_dodge(0.9)) +
-	# stat_summary(
-	# 	fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-	# 	geom='label', position=position_dodge(0.9), show.legend=FALSE
-	# ) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Voice',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('Active', 'Passive', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_manual(
-		'Underlying role',
-		breaks = c('Subject target', 'Object target'),
-		labels = c('White-colored nouns (subjects)', 'Red-colored nouns (objects)'),
-		values = c('#ffffff', '#ef756a')
-	) +
-	ggtitle(paste0('Pr. Correct by Voice (white subjects; red objects)')) +
-	# facet_grid(data_source ~ mask_added_tokens + stop_at)
-	facet_grid(linear ~ data_source)
-
-ggsave(
-	'bv-SVO-OSV-exp-by-linear.pdf',
-	width = 13,
-	height = 5,
-	units = 'in'
-)
-
-exp |> 
-	filter(
-		mask_added_tokens == "Don't mask blork", 
-		stop_at == 'convergence',
-		data_source %in% c('human', 'BERT', 'ModernBERT Base', 'ModernBERT Large')
-	) |>
-	mutate(data_source = case_when(data_source == 'human' ~ 'People', TRUE ~ paste0(data_source, '\n(fine-tuned)'))) |>
-	select(-correct.pre.training) |>
-	rbind(
-		exp |> 
-			filter(data_source %in% c('BERT', 'ModernBERT Base', 'ModernBERT Large')) |>
-			select(-correct) |> 
-			droplevels() |>
-			rename(correct = correct.pre.training) |>
-			mutate(data_source = paste0(data_source, '\n(pre-fine-tuning)'))
-	) |>
-	mutate(
-		data_source = fct_relevel(
-			data_source, 'People', 'BERT\n(fine-tuned)', 'BERT\n(pre-fine-tuning)', 
-			'ModernBERT Base\n(fine-tuned)', 'ModernBERT Base\n(pre-fine-tuning)',
-			'ModernBERT Large\n(fine-tuned)', 'ModernBERT Large\n(pre-fine-tuning)'
-		)
-	) |>
-	ggplot(aes(x = voice, y = as.numeric(correct), fill = target_response)) +
-	stat_summary(fun = mean, geom = 'bar', position = 'dodge', width = 0.9, color = 'black') +
-	stat_summary(fun.data = beta_ci, geom = 'errorbar', width = 0.33, position = position_dodge(0.9)) +
-	# stat_summary(
-	# 	fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-	# 	geom='label', position=position_dodge(0.9), show.legend=FALSE
-	# ) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Voice',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('Active', 'Passive', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_manual(
-		'Underlying role',
-		breaks = c('Subject target', 'Object target'),
-		labels = c('White-colored nouns (subjects)', 'Red-colored nouns (objects)'),
-		values = c('#ffffff', '#ef756a')
-	) +
-	ggtitle(paste0('Pr. Correct by Voice (building subjects; vehicle objects)')) +
-	# facet_grid(data_source ~ mask_added_tokens + stop_at)
-	facet_grid(. ~ data_source)
-
-ggsave(
-	'bv-SVO-OSV-exp.pdf',
-	width = 13,
-	height = 3,
-	units = 'in'
-)
-
-filler |> 
-	filter(
-		mask_added_tokens == "Don't mask blork", 
-		stop_at == 'convergence',
-		data_source %in% c('human', 'BERT', 'ModernBERT Base', 'ModernBERT Large')# ,
-		# !subject %in% all.excluded.subjects$subject
-	) |>
-	mutate(data_source = case_when(data_source == 'human' ~ 'People', TRUE ~ paste0(data_source, '\n(fine-tuned)'))) |>
-	select(-correct.pre.training) |>
-	rbind(
-		filler |> 
-			filter(data_source %in% c('BERT', 'ModernBERT Base', 'ModernBERT Large')) |>
-			select(-correct) |> 
-			droplevels() |>
-			rename(correct = correct.pre.training) |>
-			mutate(data_source = paste0(data_source, '\n(pre-fine-tuning)'))
-	) |>
-	mutate(
-		data_source = fct_relevel(
-			data_source, 'People', 'BERT\n(fine-tuned)', 'BERT\n(pre-fine-tuning)', 
-			'ModernBERT Base\n(fine-tuned)', 'ModernBERT Base\n(pre-fine-tuning)',
-			'ModernBERT Large\n(fine-tuned)', 'ModernBERT Large\n(pre-fine-tuning)'
-		)
-	) |>
-	ggplot(aes(x = voice, y = as.numeric(correct), fill = target_response)) +
-	stat_summary(fun = mean, geom = 'bar', position = 'dodge', width = 0.9, color = 'black') +
-	stat_summary(fun.data = beta_ci, geom = 'errorbar', width = 0.33, position = position_dodge(0.9)) +
-	# stat_summary(
-	# 	fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-	# 	geom='label', position=position_dodge(0.9), show.legend=FALSE
-	# ) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Voice',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('Active', 'Passive', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete(
-		'Underlying role',
-		breaks = c('Subject target', 'Object target'),
-		labels = c('Subject', 'Object')
-	) +
-	ggtitle(paste0('Pr. Correct by Voice (fillers for white subjects; red objects)')) +
-	facet_grid(. ~ data_source)
-
-ggsave(
-	'bv-SVO-OSV-filler.pdf',
-	width = 13,
-	height = 3,
-	units = 'in'
-)
-
-filler |> 
-	filter(
-		mask_added_tokens == "Don't mask blork", 
-		stop_at == 'convergence',
-		data_source %in% c('human', 'BERT', 'ModernBERT Base', 'ModernBERT Large')# ,
-		# !subject %in% all.excluded.subjects$subject
-	) |>
-	mutate(
-		data_source = case_when(data_source == 'human' ~ 'People', TRUE ~ data_source),
-		correct_source = case_when(data_source == 'People' ~ '', TRUE ~ 'fine-tuned')
-	) |>
-	select(-correct.pre.training) |>
-	rbind(
-		filler |> 
-			filter(data_source %in% c('BERT', 'ModernBERT Base', 'ModernBERT Large')) |>
-			select(-correct) |> 
-			droplevels() |>
-			rename(correct = correct.pre.training) |>
-			mutate(correct_source = 'pre-fine-tuning')
-	) |>
-	mutate(
-		data_source = fct_relevel(
-			data_source, 'People', 'BERT', 'ModernBERT Base', 'ModernBERT Large'
-		)
-	) |> 
-	ggplot(aes(x = voice, y = as.numeric(correct), fill = target_response)) +
-	stat_summary(fun = mean, geom = 'bar', position = 'dodge', width = 0.9, color = 'black') +
-	stat_summary(fun.data = beta_ci, geom = 'errorbar', width = 0.33, position = position_dodge(0.9)) +
-	# stat_summary(
-	# 	fun.data=\(y) data.frame(y=mean(y), label=sprintf('%.2f', mean(y)), fill='white'), 
-	# 	geom='label', position=position_dodge(0.9), show.legend=FALSE
-	# ) +
-	ylim(0, 1) +
-	scale_x_discrete(
-		'Voice',
-		breaks = c('SVO active', 'OVS passive', 'OSV active'),
-		labels = c('Active', 'Passive', '(OSV)')
-	) +
-	ylab('Pr. Correct') +
-	scale_fill_discrete(
-		'Underlying role',
-		breaks = c('Subject target', 'Object target'),
-		labels = c('Subject', 'Object')
-	) +
-	ggtitle(paste0('Pr. Correct by Voice (fillers for white subjects; red objects)')) +
-	# facet_grid(data_source ~ mask_added_tokens + stop_at)
-	facet_grid(
-		args_group ~ data_source + correct_source
-	)
-
-ggsave(
-	'bv-SVO-OSV-filler-by-args.pdf',
-	height = 11,
-	width = 12,
-	units = 'in'
-)
