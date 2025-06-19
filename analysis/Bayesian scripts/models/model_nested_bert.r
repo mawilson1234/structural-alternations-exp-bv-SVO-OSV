@@ -5,6 +5,6 @@ fit.model(
 	model.type = 'nested',
 	data.file = 'accuracy-data-nested.csv',
 	data.function = ident,
-	data.sources = c('human', 'BERT', 'ModernBERT Base', 'ModernBERT Large'),
+	data.sources = c('human', 'BERT'),
 	formula.name = 'voice.n_i_n_tr_i_n_ds'
 )
