@@ -17,6 +17,6 @@ analysis/accuracy-data.csv
 analysis/*.csv.gz
 analysis/test-priors.r
 
-analysis/Bayesian scripts/models/model_crossed_*
+# analysis/Bayesian scripts/models/model_crossed_*
 *.pdf
 prolific_ci_sims.r
