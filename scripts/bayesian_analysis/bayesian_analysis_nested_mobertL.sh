@@ -11,6 +11,7 @@
 #SBATCH --time=12:00:00
 #SBATCH --mail-type=FAIL,END,INVALID_DEPEND
 
+module unload miniconda
 module load R/4.4.1-foss-2022b
 
 echo Running script: scripts/bayesian_analysis/bayesian_analysis_nested_mobertL.sh
